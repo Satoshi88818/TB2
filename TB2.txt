@@ -1,0 +1,339 @@
+"""
+Quantum Gravity Simulation: Single-File Monorepo Version
+This consolidates the entire modular codebase into one executable script.
+Run directly with: python this_script.py
+Requires: numpy, scipy, matplotlib, hydra-core, omegaconf (pip install them).
+Overrides config via CLI: python this_script.py grid.N=10
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from scipy.linalg import eigh
+from typing import Tuple, Dict, List
+from abc import ABC, abstractmethod
+import logging
+from omegaconf import DictConfig
+import hydra
+from hydra.core.config_store import ConfigStore
+
+# Config setup (embedded Hydra default)
+cs = ConfigStore.instance()
+cs.store(name="default", node={
+    "grid": {"N": 5, "L": 1.0, "DX": "${grid.L / grid.N}"},
+    "physics": {
+        "HBAR": 1.0, "MASS": 1.0, "G": 1.0, "C": 1.0, "KAPPA": 1.0,
+        "ALPHA": 0.1, "ENTANGLE_COUPLE": 0.1, "LAMBDA": 1.0, "OMEGA": 0.1,
+        "T0": 1.0, "WAVE_SPEED": 1.0
+    },
+    "evolution": {"DT": 0.01, "T_STEPS": 100},
+    "io": {"output_file": "simulation.gif", "interval": 100}
+})
+
+# Core: Grids
+def build_6d_grid(grid_config: dict) -> tuple:
+    N, L = grid_config["N"], grid_config["L"]
+    x = np.linspace(0, L, N)
+    x1 = x.reshape((N, 1, 1, 1, 1, 1))
+    y1 = x.reshape((1, N, 1, 1, 1, 1))
+    z1 = x.reshape((1, 1, N, 1, 1, 1))
+    x2 = x.reshape((1, 1, 1, N, 1, 1))
+    y2 = x.reshape((1, 1, 1, 1, N, 1))
+    z2 = x.reshape((1, 1, 1, 1, 1, N))
+    return (x1, y1, z1, x2, y2, z2), x
+
+def build_3d_grid(grid_config: dict) -> np.ndarray:
+    N, L = grid_config["N"], grid_config["L"]
+    return np.linspace(0, L, N)
+
+# Core: Potentials
+def potential(x1, y1, z1, x2, y2, z2, L: float, mass: float, entangle_couple: float) -> np.ndarray:
+    k = 1.0
+    V1 = 0.5 * k * ((x1 - L / 2)**2 + (y1 - L / 2)**2 + (z1 - L / 2)**2)
+    V2 = 0.5 * k * ((x2 - L / 2)**2 + (y2 - L / 2)**2 + (z2 - L / 2)**2)
+    dist = np.sqrt((x1 - x2)**2 + (y1 - y2)**2 + (z1 - z2)**2)
+    V_int = entangle_couple * dist
+    return V1 + V2 + V_int
+
+# Core: Operators
+class Laplacian(ABC):
+    @abstractmethod
+    def apply(self, psi: np.ndarray, dx: float, axes: tuple = None) -> np.ndarray:
+        pass
+
+class FiniteDiffLaplacian(Laplacian):
+    def apply(self, psi: np.ndarray, dx: float, axes: tuple[int, ...] = None) -> np.ndarray:
+        if axes is None:
+            axes = range(psi.ndim)
+        lap = np.zeros_like(psi)
+        for i in axes:
+            d2 = np.gradient(np.gradient(psi, dx, axis=i), dx, axis=i)
+            lap += d2
+        return lap
+
+# Models: Wavefunction
+class Wavefunction:
+    def __init__(self, coords: Tuple[np.ndarray, ...], grid_config: dict, physics_config: dict):
+        self.coords = coords
+        x1, y1, z1, x2, y2, z2 = coords
+        self.x = build_6d_grid(grid_config)[1]
+        self.dx = grid_config["DX"]
+        self.psi = self._initialize(x1, y1, z1, x2, y2, z2, grid_config["L"])
+        self.normalize()
+        self.lap = FiniteDiffLaplacian()
+        self.physics = physics_config
+
+    def _initialize(self, x1, y1, z1, x2, y2, z2, L):
+        sigma = L / 10
+        gauss_left = np.exp(-((x1 - L/4)**2 + (y1 - L/2)**2 + (z1 - L/2)**2) / (2 * sigma**2) -
+                            ((x2 - 3*L/4)**2 + (y2 - L/2)**2 + (z2 - L/2)**2) / (2 * sigma**2))
+        gauss_right = np.exp(-((x1 - 3*L/4)**2 + (y1 - L/2)**2 + (z1 - L/2)**2) / (2 * sigma**2) -
+                             ((x2 - L/4)**2 + (y2 - L/2)**2 + (z2 - L/2)**2) / (2 * sigma**2))
+        return 0.1 * (gauss_left + gauss_right) * np.exp(1j * np.pi * (x1 + x2) / L) / np.sqrt(2)
+
+    def normalize(self) -> None:
+        integral = self._integrate_6d(np.abs(self.psi)**2)
+        if np.isfinite(integral):
+            self.psi /= np.sqrt(integral)
+
+    def _integrate_6d(self, f: np.ndarray) -> float:
+        for axis in range(5, -1, -1):
+            f = np.trapz(f, self.x, axis=axis)
+        return f.item()
+
+    def evolve_rk4(self, dt: float, t: float, T_mean: float, physics: dict) -> None:
+        def H(psi_t: np.ndarray) -> np.ndarray:
+            return self._hamiltonian(psi_t, t, T_mean, physics)
+
+        hbar = physics["HBAR"]
+        k1 = dt * (-1j / hbar) * H(self.psi)
+        mid1 = self.normalize_step(self.psi + 0.5 * k1)
+        k2 = dt * (-1j / hbar) * H(mid1)
+        mid2 = self.normalize_step(self.psi + 0.5 * k2)
+        k3 = dt * (-1j / hbar) * H(mid2)
+        mid3 = self.normalize_step(self.psi + k3)
+        k4 = dt * (-1j / hbar) * H(mid3)
+        self.psi = self.normalize_step(self.psi + (k1 + 2*k2 + 2*k3 + k4) / 6)
+        self.normalize()
+
+    def normalize_step(self, psi_step: np.ndarray) -> np.ndarray:
+        integral = self._integrate_6d(np.abs(psi_step)**2)
+        return psi_step / np.sqrt(integral) if np.isfinite(integral) else psi_step
+
+    def _hamiltonian(self, psi_t: np.ndarray, t: float, T_mean: float, physics: dict) -> np.ndarray:
+        lap_psi = self.lap.apply(psi_t, self.dx)
+        L = physics.get("L", 1.0)  # Fallback
+        V = potential(*self.coords, L, physics["MASS"], physics["ENTANGLE_COUPLE"])
+        H_Q = -(physics["HBAR"]**2 / (2 * physics["MASS"])) * lap_psi + V * psi_t
+        R = self._gravitational_term(psi_t, physics)
+        R_6d = np.broadcast_to(R[:, :, :], psi_t.shape[:3] + (1, 1, 1))
+        H_G = physics["ALPHA"] * physics["HBAR"] * physics["C"] * R_6d * psi_t
+        return T_mean * (H_Q + H_G)
+
+    def _gravitational_term(self, psi_t: np.ndarray, physics: dict) -> np.ndarray:
+        rho1 = marginal_density(psi_t, particle=1, x=self.x)
+        rho2 = marginal_density(psi_t, particle=2, x=self.x)
+        avg_rho = (rho1 + rho2) / 2
+        energy_density = physics["MASS"] * avg_rho * physics["C"]**2
+        R = 8 * np.pi * physics["G"] / physics["C"]**4 * energy_density
+        return R
+
+# Models: TimeField
+class TimeField:
+    def __init__(self, grid_config: dict, t0: float):
+        N = grid_config["N"]
+        self.T = t0 * np.ones((N, N, N))
+        self.T_old = self.T.copy()
+        self.T_new = self.T.copy()
+        self.dx = grid_config["DX"]
+
+    def update(self, psi: np.ndarray, dt: float, physics: dict, evolution: dict) -> None:
+        rho1 = marginal_density(psi, particle=1, x=np.linspace(0, 1, psi.shape[0]))
+        rho2 = marginal_density(psi, particle=2, x=np.linspace(0, 1, psi.shape[0]))
+        avg_rho = (rho1 + rho2) / 2
+        R = self._gravitational_term(psi, physics)
+        d2_dx2 = np.gradient(np.gradient(self.T, self.dx, axis=0), self.dx, axis=0)
+        d2_dy2 = np.gradient(np.gradient(self.T, self.dx, axis=1), self.dx, axis=1)
+        d2_dz2 = np.gradient(np.gradient(self.T, self.dx, axis=2), self.dx, axis=2)
+        laplacian = d2_dx2 + d2_dy2 + d2_dz2
+        source = physics["LAMBDA"] * (avg_rho + physics["KAPPA"] * R)
+        self.T_new = (2 * self.T - self.T_old + dt**2 * evolution["WAVE_SPEED"]**2 * laplacian +
+                      dt**2 * source - dt**2 * physics["OMEGA"]**2 * self.T)
+        # Neumann BC
+        self.T_new[0, :, :] = self.T_new[1, :, :]
+        self.T_new[-1, :, :] = self.T_new[-2, :, :]
+        self.T_new[:, 0, :] = self.T_new[:, 1, :]
+        self.T_new[:, -1, :] = self.T_new[:, -2, :]
+        self.T_new[:, :, 0] = self.T_new[:, :, 1]
+        self.T_new[:, :, -1] = self.T_new[:, :, -2]
+        self.T_old = self.T.copy()
+        self.T = self.T_new.copy()
+
+    def _gravitational_term(self, psi: np.ndarray, physics: dict) -> np.ndarray:
+        rho1 = marginal_density(psi, particle=1)
+        rho2 = marginal_density(psi, particle=2)
+        avg_rho = (rho1 + rho2) / 2
+        energy_density = physics["MASS"] * avg_rho * physics["C"]**2
+        return 8 * np.pi * physics["G"] / physics["C"]**4 * energy_density
+
+    def mean(self) -> float:
+        return np.mean(self.T)
+
+# Observables: Densities
+def marginal_density(psi: np.ndarray, particle: int = 1, x: np.ndarray = None) -> np.ndarray:
+    if x is None:
+        x = np.linspace(0, 1, psi.shape[0])
+    if particle == 1:
+        return np.trapz(np.trapz(np.trapz(np.abs(psi)**2, x, axis=5), x, axis=4), x, axis=3)
+    else:
+        return np.trapz(np.trapz(np.trapz(np.abs(psi)**2, x, axis=2), x, axis=1), x, axis=0)
+
+# Observables: Entropy
+def entanglement_entropy(psi: np.ndarray, N: int, dx: float) -> float:
+    psi_flat = psi.reshape((N**3, N**3))
+    rho_reduced = np.dot(psi_flat.conj().T, psi_flat) * (dx**6)
+    eigenvalues = eigh(rho_reduced, eigvals_only=True)
+    eigenvalues = eigenvalues[eigenvalues > 1e-10]
+    S = -np.sum(eigenvalues * np.log(eigenvalues))
+    return S if np.isfinite(S) else 0.0
+
+# Observables: Diagnostics
+def total_energy(psi: np.ndarray, coords: tuple, t: float, L: float, physics: dict, T_mean: float, dt: float) -> float:
+    from .core.operators import FiniteDiffLaplacian  # Avoid circular; use global
+    lap = FiniteDiffLaplacian().apply(psi, L / psi.shape[0])
+    x1, y1, z1, x2, y2, z2 = coords
+    V = potential(x1, y1, z1, x2, y2, z2, L, physics["MASS"], physics["ENTANGLE_COUPLE"])
+    H_Q = -(physics["HBAR"]**2 / (2 * physics["MASS"])) * lap + V * psi
+    rho1 = marginal_density(psi, 1)
+    rho2 = marginal_density(psi, 2)
+    avg_rho = (rho1 + rho2) / 2
+    R = 8 * np.pi * physics["G"] / physics["C"]**4 * physics["MASS"] * avg_rho * physics["C"]**2
+    R_6d = np.broadcast_to(R[:, :, :], psi.shape)
+    H_G = physics["ALPHA"] * physics["HBAR"] * physics["C"] * R_6d * psi
+    H = T_mean * (H_Q + H_G)
+    x_int = np.linspace(0, L, psi.shape[0])
+    integral = np.trapz(np.trapz(np.trapz(np.trapz(np.trapz(np.trapz(np.real(np.conj(psi) * H), x_int, axis=5), x_int, axis=4), x_int, axis=3), x_int, axis=2), x_int, axis=1), x_int, axis=0)
+    return integral
+
+# Engine: Simulator
+class Simulator:
+    def __init__(self, config: DictConfig):
+        self.config = config
+        grid_cfg = config.grid
+        physics_cfg = config.physics
+        evolution_cfg = config.evolution
+        coords, self.x = build_6d_grid(dict(grid_cfg))
+        self.psi = Wavefunction(coords, dict(grid_cfg), dict(physics_cfg))
+        self.T_field = TimeField(dict(grid_cfg), physics_cfg.T0)
+        self.dt = evolution_cfg.DT
+        self.steps = evolution_cfg.T_STEPS
+        self.logger = SimLogger()
+
+    def run(self) -> List[Dict]:
+        diags = []
+        for frame in range(self.steps):
+            t = frame * self.dt
+            self.T_field.update(self.psi.psi, self.dt, dict(self.config.physics), dict(self.config.evolution))
+            self.psi.evolve_rk4(self.dt, t, self.T_field.mean(), dict(self.config.physics))
+            diag = self._compute_diagnostics(t)
+            diags.append(diag)
+            self.logger.log_step(diag)
+        return diags
+
+    def _compute_diagnostics(self, t: float) -> Dict:
+        rho1_3d = marginal_density(self.psi.psi, particle=1, x=self.x)
+        rho2_3d = marginal_density(self.psi.psi, particle=2, x=self.x)
+        avg_rho_3d = (rho1_3d + rho2_3d) / 2
+        proj_avg_rho = self._project_to_1d(avg_rho_3d)
+        proj_T = self._project_to_1d(self.T_field.T)
+        std_t = np.std(proj_T)
+        std_rho = np.std(proj_avg_rho)
+        correlation = np.corrcoef(proj_T, proj_avg_rho)[0, 1] if std_t > 0 and std_rho > 0 else 0.0
+        S = entanglement_entropy(self.psi.psi, self.config.grid.N, self.config.grid.DX)
+        norm = self.psi._integrate_6d(np.abs(self.psi.psi)**2)
+        energy = total_energy(self.psi.psi, self.psi.coords, t, self.config.grid.L, dict(self.config.physics), self.T_field.mean(), self.dt)
+        return {
+            "t": t, "norm": norm, "energy": energy, "correlation": correlation, "entropy": S,
+            "proj_rho1": self._project_to_1d(rho1_3d), "proj_rho2": self._project_to_1d(rho2_3d), "proj_T": proj_T
+        }
+
+    def _project_to_1d(self, rho_3d: np.ndarray) -> np.ndarray:
+        return np.trapz(np.trapz(rho_3d, self.x, axis=2), self.x, axis=1)
+
+# IO: Viz
+class Viz:
+    def __init__(self, config: DictConfig, x: np.ndarray):
+        self.config = config
+        self.x = x
+        self.fig, (self.ax1, self.ax2, self.ax3) = plt.subplots(3, 1, figsize=(8, 8))
+        self.line1, = self.ax1.plot(x, np.zeros_like(x), label='Proj ρ1(x)')
+        self.line2, = self.ax2.plot(x, np.zeros_like(x), label='Proj ρ2(x)')
+        self.line3, = self.ax3.plot(x, np.zeros_like(x), label='Proj T(x)')
+        self.ax1.set_xlabel('x'); self.ax1.set_ylabel('Projected Density')
+        self.ax2.set_xlabel('x'); self.ax2.set_ylabel('Projected Density')
+        self.ax3.set_xlabel('x'); self.ax3.set_ylabel('Projected Time Field')
+        L = config.grid.L
+        self.ax1.set_xlim(0, L); self.ax2.set_xlim(0, L); self.ax3.set_xlim(0, L)
+        self.ax1.legend(); self.ax2.legend(); self.ax3.legend()
+
+    def update(self, diag: Dict) -> tuple:
+        self.line1.set_ydata(diag["proj_rho1"])
+        self.line2.set_ydata(diag["proj_rho2"])
+        self.line3.set_ydata(diag["proj_T"])
+        t = diag["t"]
+        self.ax1.set_title(f'Proj Particle 1 at t = {t:.2f}')
+        self.ax2.set_title(f'Proj Particle 2 at t = {t:.2f}')
+        self.ax3.set_title(f'Proj Time Field at t = {t:.2f}')
+        max_rho = max(np.max(diag["proj_rho1"]), np.max(diag["proj_rho2"]))
+        self.ax1.set_ylim(0, max(max_rho, 1e-3)*1.1)
+        self.ax2.set_ylim(0, max(max_rho, 1e-3)*1.1)
+        self.ax3.set_ylim(0.9, 1.1)
+        return self.line1, self.line2, self.line3
+
+    def animate(self, diags: List[Dict], output_file: str) -> FuncAnimation:
+        def update_frame(frame):
+            return self.update(diags[frame])
+        ani = FuncAnimation(self.fig, update_frame, frames=len(diags), interval=self.config.io.interval, blit=True)
+        ani.save(output_file, writer='pillow')
+        plt.show()
+        return ani
+
+# IO: Logger
+class SimLogger:
+    def __init__(self):
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+
+    def log_step(self, diag: dict):
+        self.logger.info(f"t = {diag['t']:.2f}, Norm = {diag['norm']:.6f}, Energy = {diag['energy']:.2f}, Corr = {diag['correlation']:.4f}, Entropy = {diag['entropy']:.4f}")
+
+    def log_final(self, initial_entropy: float, final_entropy: float, initial_T: np.ndarray, final_T: np.ndarray):
+        self.logger.info(f"Initial Entanglement Entropy: {initial_entropy:.4f}")
+        self.logger.info(f"Final Entanglement Entropy: {final_entropy:.4f}")
+        self.logger.info(f"Initial T range: {initial_T.min():.2f} to {initial_T.max():.2f}")
+        self.logger.info(f"Final T range: {final_T.min():.2f} to {final_T.max():.2f}")
+
+# Main Entry
+@hydra.main(version_base=None, config_path=None, config_name="default")
+def main(cfg: DictConfig):
+    sim = Simulator(cfg)
+    diags = sim.run()
+    viz = Viz(cfg, sim.x)
+    ani = viz.animate(diags, cfg.io.output_file)
+
+    # Final diagnostics
+    grid_dict = dict(cfg.grid)
+    physics_dict = dict(cfg.physics)
+    coords, _ = build_6d_grid(grid_dict)
+    initial_psi = Wavefunction(coords, grid_dict, physics_dict)
+    initial_entropy = entanglement_entropy(initial_psi.psi, cfg.grid.N, cfg.grid.DX)
+    final_entropy = diags[-1]["entropy"]
+    N = cfg.grid.N
+    initial_T = cfg.physics.T0 * np.ones((N, N, N))
+    final_T = sim.T_field.T
+    sim.logger.log_final(initial_entropy, final_entropy, initial_T, final_T)
+
+    print("Simulation complete. GIF saved.")
+
+if __name__ == "__main__":
+    main()
